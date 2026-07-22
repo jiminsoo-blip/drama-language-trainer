@@ -14,11 +14,22 @@ createRoot(document.getElementById('root')!).render(
   </StrictMode>,
 )
 
-// Offline-first PWA: cache-first service worker (production only).
+// Offline-first PWA: service worker (production only). Check for updates on
+// every load; when a new SW takes control, reload once so users are never
+// stuck on a stale cached version.
 if (import.meta.env.PROD && 'serviceWorker' in navigator) {
+  let reloaded = false
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    if (reloaded) return
+    reloaded = true
+    window.location.reload()
+  })
   window.addEventListener('load', () => {
-    navigator.serviceWorker.register(`${import.meta.env.BASE_URL}sw.js`).catch(() => {
-      // offline caching is best-effort; the app works without it
-    })
+    navigator.serviceWorker
+      .register(`${import.meta.env.BASE_URL}sw.js`)
+      .then((reg) => reg.update())
+      .catch(() => {
+        // offline caching is best-effort; the app works without it
+      })
   })
 }
