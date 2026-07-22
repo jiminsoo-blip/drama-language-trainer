@@ -14,6 +14,7 @@ import {
   PanelRight,
   Pause,
   Play,
+  SlidersHorizontal,
   StepBack,
   StepForward,
   Tv,
@@ -35,6 +36,15 @@ import { activeLineIndex, translationAt } from '@/lib/subtitles'
 import { buildEstimatedLines, cumulativeFractions } from '@/lib/pdfScript'
 import { loadDictionary, longestMatch } from '@/lib/dictionary'
 import { loadPdfOffset, savePdfOffset } from '@/lib/pdfSync'
+import {
+  loadSyncAnchors,
+  nudgeAnchors,
+  offsetAtVideo,
+  saveSyncAnchors,
+  subtitleToVideo,
+  upsertAnchor,
+  type SyncAnchor,
+} from '@/lib/syncAnchors'
 import {
   loadDisplaySettings,
   loadViewSettings,
@@ -116,6 +126,48 @@ export default function StudyView({
   const isPdf = pdf !== null
   const estimatedSync = isPdf && pdf.sync === 'estimated'
 
+  // -- multi-anchor subtitle sync (ad-insertion correction) -------------------
+  // Keyed by the same video-file identity used for recent sessions, so
+  // anchors never leak across files. Applies to SRT subtitle mode only;
+  // PDF modes keep their own (estimated/real) sync handling.
+  const syncKey = sessionIdFor({
+    videoName: media.videoName,
+    subsName: media.subsName || null,
+    pdfName: media.pdf?.fileName ?? null,
+  })
+  const syncEligible = hasVideo && !isPdf
+  const [anchors, setAnchorsState] = useState<SyncAnchor[]>(() =>
+    syncEligible ? loadSyncAnchors(syncKey) : [],
+  )
+  const [syncOpen, setSyncOpen] = useState(false)
+  // line picked in the subtitle list for calibration (panel-open only)
+  const [selectedSyncIdx, setSelectedSyncIdx] = useState(-1)
+
+  // selection is meaningful only while calibrating; drop it when the panel
+  // closes or another video is loaded
+  useEffect(() => {
+    if (!syncOpen) setSelectedSyncIdx(-1)
+  }, [syncOpen])
+  useEffect(() => setSelectedSyncIdx(-1), [syncKey])
+
+  // reload anchors when a different video is loaded into the same view
+  const syncKeyRef = useRef(syncKey)
+  useEffect(() => {
+    if (syncKeyRef.current === syncKey) return
+    syncKeyRef.current = syncKey
+    setAnchorsState(syncEligible ? loadSyncAnchors(syncKey) : [])
+  }, [syncKey, syncEligible])
+
+  const setAnchors = useCallback(
+    (next: SyncAnchor[]) => {
+      setAnchorsState(next)
+      saveSyncAnchors(syncKey, next)
+    },
+    [syncKey],
+  )
+
+  const syncActive = syncEligible && anchors.length > 0
+
   // PDF estimated-sync offset (persisted per PDF file name)
   const [pdfOffset, setPdfOffsetState] = useState(() => loadPdfOffset(pdf?.fileName))
   const setPdfOffset = useCallback(
@@ -128,12 +180,22 @@ export default function StudyView({
 
   // Lines used for timing. PDF without real timestamps: distribute sentence
   // starts proportionally to Chinese char counts + global offset.
+  // SRT with sync anchors: warp original subtitle times into video time
+  // (piecewise-linear through the anchors) — everything downstream
+  // (active-line detection, seek, A-B, overlay) then works in video time.
   const lines = useMemo<SubtitleLine[]>(() => {
     if (estimatedSync && hasVideo && duration > 0 && pdf) {
       return buildEstimatedLines(pdf.sentences, duration, pdfOffset)
     }
+    if (syncActive) {
+      return media.subs.map((l) => {
+        const start = subtitleToVideo(anchors, l.start)
+        const end = subtitleToVideo(anchors, l.end)
+        return { ...l, start, end: Math.max(end, start + 0.05) }
+      })
+    }
     return media.subs
-  }, [estimatedSync, hasVideo, duration, pdf, pdfOffset, media.subs])
+  }, [estimatedSync, hasVideo, duration, pdf, pdfOffset, syncActive, anchors, media.subs])
 
   const baseFractions = useMemo(
     () => (pdf ? cumulativeFractions(pdf.sentences) : []),
@@ -147,10 +209,12 @@ export default function StudyView({
   const translationForIdx = useCallback(
     (idx: number): string | null => {
       if (pdf) return pdf.sentences[idx]?.korean ?? null
-      const line = lines[idx]
-      return line ? translationAt(transSubs, line.start + 0.01) : null
+      // look up in ORIGINAL subtitle time — the translation track shares the
+      // unwarped timeline, so the sync warp must not leak into this lookup
+      const orig = media.subs[idx]
+      return orig ? translationAt(transSubs, orig.start + 0.01) : null
     },
-    [pdf, lines, transSubs],
+    [pdf, media.subs, transSubs],
   )
 
   const set = useCallback(
@@ -520,6 +584,38 @@ export default function StudyView({
     setPdfOffset(clamp(currentTime - baseStart, -120, 120))
   }, [activeIdx, duration, baseFractions, currentTime, setPdfOffset])
 
+  // -- sync anchor actions ----------------------------------------------------
+
+  /** effective offset at the playhead right now (for the panel + chip) */
+  const currentSyncOffset = syncActive ? offsetAtVideo(anchors, currentTime) : 0
+
+  /** primary calibration gesture: pin the SELECTED line (fallback: the
+   * time-based active line) to the playhead, then reveal the correction */
+  const calibrateSyncHere = useCallback(() => {
+    if (!syncEligible) return
+    const calibIdx = selectedSyncIdx >= 0 ? selectedSyncIdx : activeIdx
+    if (calibIdx < 0) return
+    const orig = media.subs[calibIdx]
+    if (!orig) return
+    const anchor: SyncAnchor = { videoTime: currentTime, subtitleTime: orig.start }
+    setAnchors(upsertAnchor(anchors, anchor))
+    setSelectedSyncIdx(-1)
+    // land on the anchor so the corrected active line immediately matches
+    // what is on screen (no-op seek when already paused there)
+    if (videoRef.current) videoRef.current.currentTime = anchor.videoTime
+  }, [syncEligible, selectedSyncIdx, activeIdx, media.subs, anchors, currentTime, setAnchors])
+
+  const nudgeSync = useCallback(
+    (delta: number) => setAnchors(nudgeAnchors(anchors, delta)),
+    [anchors, setAnchors],
+  )
+
+  const clearSync = useCallback(() => setAnchors([]), [setAnchors])
+
+  const jumpToAnchor = useCallback((a: SyncAnchor) => {
+    if (videoRef.current) videoRef.current.currentTime = a.videoTime
+  }, [])
+
   const showPanel = !watch || view.panelOpen
 
   // -- render ---------------------------------------------------------------
@@ -807,6 +903,38 @@ export default function StudyView({
                   </span>
                 )}
 
+                {/* subtitle sync (multi-anchor, ad-insertion correction) */}
+                {syncEligible && (
+                  <>
+                    <div className="mx-1 h-5 w-px bg-zinc-800" />
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          onClick={() => setSyncOpen((o) => !o)}
+                          className={cn(
+                            'text-zinc-300',
+                            (syncOpen || syncActive) && 'text-sky-300',
+                          )}
+                          aria-label="자막 싱크 보정"
+                        >
+                          <SlidersHorizontal className="mr-1 h-4 w-4" />
+                          싱크
+                          {syncActive && (
+                            <span className="ml-1 rounded-full bg-sky-500/20 px-1.5 text-[11px]">
+                              {anchors.length}
+                            </span>
+                          )}
+                        </Button>
+                      </TooltipTrigger>
+                      <TooltipContent>
+                        자막 싱크 보정 — 광고 삽입 등으로 밀린 자막을 구간별로 맞춥니다
+                      </TooltipContent>
+                    </Tooltip>
+                  </>
+                )}
+
                 {/* overlay options (watch mode) */}
                 {watch && (
                   <>
@@ -881,6 +1009,109 @@ export default function StudyView({
               </div>
             )}
           </div>
+
+          {/* subtitle sync panel (multi-anchor; SRT subtitle mode only) */}
+          {syncEligible && syncOpen && (
+            <div className="flex flex-col gap-2 border-b border-zinc-800 bg-zinc-900/40 px-4 py-2.5">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-xs font-medium text-sky-300">자막 싱크</span>
+                <span className="font-mono text-xs text-zinc-400 tabular-nums">
+                  현재 오프셋 {currentSyncOffset >= 0 ? '+' : ''}
+                  {currentSyncOffset.toFixed(1)}초
+                </span>
+                <div className="flex items-center gap-1 rounded-lg border border-zinc-800 p-0.5">
+                  {[-1, -0.5, 0.5, 1].map((d) => (
+                    <button
+                      key={d}
+                      onClick={() => nudgeSync(d)}
+                      className="rounded-md px-1.5 py-0.5 font-mono text-[11px] text-zinc-300 transition-colors hover:bg-zinc-800"
+                      title={`전체 싱크 ${d > 0 ? '+' : ''}${d}초`}
+                    >
+                      {d > 0 ? '+' : ''}
+                      {d}s
+                    </button>
+                  ))}
+                </div>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={calibrateSyncHere}
+                  disabled={selectedSyncIdx < 0 && activeIdx < 0}
+                  className="h-7 border-sky-800 text-xs text-sky-300 hover:bg-sky-950"
+                  title="지금 화면의 대사가 현재 재생 위치에서 나오도록 앵커를 만듭니다"
+                >
+                  <Crosshair className="mr-1 h-3.5 w-3.5" />
+                  {selectedSyncIdx >= 0
+                    ? '선택한 대사를 지금 위치에 맞추기'
+                    : '이 대사를 지금 위치에 맞추기'}
+                </Button>
+                {anchors.length > 0 && (
+                  <button
+                    onClick={clearSync}
+                    className="text-[11px] text-zinc-500 underline decoration-zinc-700 transition-colors hover:text-zinc-300"
+                  >
+                    전체 초기화
+                  </button>
+                )}
+              </div>
+              {selectedSyncIdx >= 0 && media.subs[selectedSyncIdx] && (
+                <div className="rounded-lg border border-sky-900/60 bg-sky-950/30 px-3 py-2">
+                  <div className="mb-1 truncate text-xs text-sky-200">
+                    선택한 문장: “{media.subs[selectedSyncIdx].text}”
+                  </div>
+                  <ol className="list-inside list-decimal space-y-0.5 text-[11px] leading-relaxed text-zinc-400">
+                    <li>목록에서 화면에 보이는 문장을 클릭해 선택 ✓</li>
+                    <li>영상을 그 문장이 실제로 나오는 순간에 일시정지</li>
+                    <li>'선택한 대사를 지금 위치에 맞추기' 클릭</li>
+                  </ol>
+                </div>
+              )}
+              {selectedSyncIdx < 0 && (
+                <p className="text-[11px] leading-relaxed text-zinc-600">
+                  이 패널이 열린 동안 자막 목록 클릭은 이동 대신 선택이 됩니다. 화면에 보이는
+                  문장을 목록에서 선택한 뒤, 그 문장이 실제로 나오는 순간에 일시정지하고
+                  '지금 위치에 맞추기'를 누르세요. 각 앵커의 오프셋은 그 앵커 위치부터 다음
+                  앵커 전까지 그대로 적용되므로, 새 앵커를 추가해도 앞서 맞춘 구간은 바뀌지
+                  않습니다. 설정은 이 영상 파일에만 저장됩니다.
+                </p>
+              )}
+              {anchors.length > 0 && (
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <span className="text-[11px] text-zinc-600">앵커 {anchors.length}개:</span>
+                  {[...anchors]
+                    .sort((a, b) => a.videoTime - b.videoTime)
+                    .map((a, i) => {
+                      const o = a.videoTime - a.subtitleTime
+                      return (
+                        <span
+                          key={`${a.videoTime}-${i}`}
+                          className="flex items-center gap-1 rounded-full border border-zinc-800 bg-zinc-950/60 py-0.5 pl-2 pr-1 font-mono text-[11px] text-zinc-400"
+                        >
+                          <button
+                            onClick={() => jumpToAnchor(a)}
+                            className="transition-colors hover:text-sky-300"
+                            title="이 앵커 위치로 이동"
+                          >
+                            {formatTime(a.videoTime)} · {o >= 0 ? '+' : ''}
+                            {o.toFixed(1)}s
+                          </button>
+                          <button
+                            onClick={() =>
+                              setAnchors(anchors.filter((x) => x !== a))
+                            }
+                            className="rounded-full p-0.5 text-zinc-600 transition-colors hover:bg-zinc-800 hover:text-zinc-300"
+                            aria-label="앵커 삭제"
+                            title="앵커 삭제"
+                          >
+                            <X className="h-3 w-3" />
+                          </button>
+                        </span>
+                      )
+                    })}
+                </div>
+              )}
+            </div>
+          )}
 
           {/* PDF pairing mismatch notice */}
           {pdf && pdf.countMismatch && (
@@ -1006,7 +1237,21 @@ export default function StudyView({
               activeIndex={activeIdx}
               labelMode={estimatedSync && (!hasVideo || duration <= 0) ? 'index' : 'time'}
               lang={lang}
-              onLineClick={(i) => seekToLine(i)}
+              syncLabel={
+                syncActive && Math.abs(currentSyncOffset) >= 0.05
+                  ? `싱크 ${currentSyncOffset >= 0 ? '+' : ''}${currentSyncOffset.toFixed(1)}초`
+                  : null
+              }
+              selectedIndex={syncEligible && syncOpen ? selectedSyncIdx : -1}
+              onLineClick={(i) => {
+                // while the sync panel is open, list clicks SELECT a line
+                // for calibration instead of seeking
+                if (syncEligible && syncOpen) {
+                  setSelectedSyncIdx((prev) => (prev === i ? -1 : i))
+                } else {
+                  seekToLine(i)
+                }
+              }}
               onCharClick={(line, charIndex, rect) => openPopupAt(line.text, charIndex, rect, line)}
               onWordClick={(line, word, rect) => openEnPopup(word, rect, line)}
             />
